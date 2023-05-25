@@ -8,8 +8,6 @@ import (
 	"github.com/hiroaqii/powerful-command-line-applications-in-go/todo"
 )
 
-const todoFileName = ".todo.json"
-
 func main() {
 	task := flag.String("task", "", "Task to be included in the ToDo list")
 	list := flag.Bool("list", false, "List all tasks")
@@ -18,6 +16,11 @@ func main() {
 	flag.Parse()
 
 	l := &todo.List{}
+
+	var todoFileName = ".todo.json"
+	if os.Getenv("TODO_FILENAME") != "" {
+		todoFileName = os.Getenv("TODO_FILENAME")
+	}
 
 	if err := l.Get(todoFileName); err != nil {
 		fmt.Fprintln(os.Stderr, err)
