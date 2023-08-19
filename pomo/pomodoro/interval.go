@@ -22,29 +22,29 @@ const (
 )
 
 type Interval struct {
-	ID             int64
-	StartTime      time.Time
-	PlanDuration   time.Duration
-	ActualDuration time.Duration
-	Category       string
-	State          int
-}
-
-type Repository interface {
-	Create(i Interval) (int64, error)
-	Update(i Interval) error
-	ById(id int64) (Interval, error)
-	Last() (Interval, error)
-	Breaks(n int) ([]Interval, error)
+	ID              int64
+	StartTime       time.Time
+	PlannedDuration time.Duration
+	ActualDuration  time.Duration
+	Category        string
+	State           int
 }
 
 var (
-	ErrNoInterval         = errors.New("No intervals")
+	ErrNoIntervals        = errors.New("No intervals")
 	ErrIntervalNotRunning = errors.New("Interval not running")
 	ErrIntervalCompleted  = errors.New("Interval is completed or cancelled")
 	ErrInvalidState       = errors.New("Invalid State")
 	ErrInvalidID          = errors.New("Invalid ID")
 )
+
+type Repository interface {
+	Create(i Interval) (int64, error)
+	Update(i Interval) error
+	ByID(id int64) (Interval, error)
+	Last() (Interval, error)
+	Breaks(n int) ([]Interval, error)
+}
 
 type IntervalConfig struct {
 	repo               Repository
@@ -76,12 +76,137 @@ func NewConfig(repo Repository, pomodoro, shortBreak, longBreak time.Duration) *
 	return c
 }
 
-func nextCategory(r Repository) (string, error) {
-	li, err := r.Last()
-	if err != nil && err != ErrNoInterval {
-		return CategoryPomodoro, nil
+func GetInterval(config *IntervalConfig) (Interval, error) {
+	i := Interval{}
+	var err error
+
+	i, err = config.repo.Last()
+
+	if err != nil && err != ErrNoIntervals {
+		return i, err
 	}
 
+	if err == nil && i.State != StateCancelled && i.State != StateDone {
+		return i, nil
+	}
+
+	return newInterval(config)
+}
+
+func newInterval(config *IntervalConfig) (Interval, error) {
+	i := Interval{}
+	category, err := nextCategory(config.repo)
+	if err != nil {
+		return i, err
+	}
+
+	i.Category = category
+
+	switch category {
+	case CategoryPomodoro:
+		i.PlannedDuration = config.PomodoroDuration
+	case CategoryShortBreak:
+		i.PlannedDuration = config.ShortBreakDuration
+	case CategoryLongBreak:
+		i.PlannedDuration = config.LongBreakDuration
+	}
+
+	if i.ID, err = config.repo.Create(i); err != nil {
+		return i, err
+	}
+
+	return i, nil
+}
+
+type Callback func(Interval)
+
+func (i Interval) Start(ctx context.Context, config *IntervalConfig,
+	start, periodic, end Callback) error {
+
+	switch i.State {
+	case StateRunning:
+		return nil
+	case StateNotStarted:
+		i.StartTime = time.Now()
+		fallthrough
+	case StatePaused:
+		i.State = StateRunning
+		if err := config.repo.Update(i); err != nil {
+			return err
+		}
+		return tick(ctx, i.ID, config, start, periodic, end)
+	case StateCancelled, StateDone:
+		return fmt.Errorf("%w: Cannot start", ErrIntervalCompleted)
+	default:
+		return fmt.Errorf("%w: %d", ErrInvalidState, i.State)
+	}
+}
+
+func (i Interval) Pause(config *IntervalConfig) error {
+	if i.State != StateRunning {
+		return ErrIntervalNotRunning
+	}
+
+	i.State = StatePaused
+
+	return config.repo.Update(i)
+}
+
+func tick(ctx context.Context, id int64, config *IntervalConfig,
+	start, periodic, end Callback) error {
+
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	i, err := config.repo.ByID(id)
+	if err != nil {
+		return err
+	}
+	expire := time.After(i.PlannedDuration - i.ActualDuration)
+
+	start(i)
+
+	for {
+		select {
+		case <-ticker.C:
+			i, err := config.repo.ByID(id)
+			if err != nil {
+				return err
+			}
+
+			if i.State == StatePaused {
+				return nil
+			}
+
+			i.ActualDuration += time.Second
+			if err := config.repo.Update(i); err != nil {
+				return err
+			}
+			periodic(i)
+		case <-expire:
+			i, err := config.repo.ByID(id)
+			if err != nil {
+				return err
+			}
+			i.State = StateDone
+			end(i)
+			return config.repo.Update(i)
+		case <-ctx.Done():
+			i, err := config.repo.ByID(id)
+			if err != nil {
+				return err
+			}
+			i.State = StateCancelled
+			return config.repo.Update(i)
+		}
+	}
+}
+
+func nextCategory(r Repository) (string, error) {
+	li, err := r.Last()
+	if err != nil && err == ErrNoIntervals {
+		return CategoryPomodoro, nil
+	}
 	if err != nil {
 		return "", err
 	}
@@ -106,128 +231,4 @@ func nextCategory(r Repository) (string, error) {
 	}
 
 	return CategoryLongBreak, nil
-}
-
-type Callback func(i Interval)
-
-func tick(cxt context.Context, id int64, config *IntervalConfig, start, periodic, end Callback) error {
-
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-
-	i, err := config.repo.ById(id)
-	if err != nil {
-		return err
-	}
-
-	expires := time.After(i.PlanDuration - i.ActualDuration)
-
-	start(i)
-
-	for {
-		select {
-		case <-ticker.C:
-			i, err = config.repo.ById(id)
-			if err != nil {
-				return err
-			}
-
-			if i.State != StatePaused {
-				return nil
-			}
-
-			i.ActualDuration += time.Second
-			if err := config.repo.Update(i); err != nil {
-				return err
-			}
-			periodic(i)
-		case <-expires:
-			i, err := config.repo.ById(id)
-			if err != nil {
-				return err
-			}
-			i.State = StateDone
-			end(i)
-			return config.repo.Update(i)
-		case <-cxt.Done():
-			i, err := config.repo.ById(id)
-			if err != nil {
-				return err
-			}
-			i.State = StateCancelled
-			return config.repo.Update(i)
-		}
-	}
-}
-
-func newInterval(config *IntervalConfig) (Interval, error) {
-	i := Interval{}
-	caregory, err := nextCategory(config.repo)
-	if err != nil {
-		return i, err
-	}
-
-	i.Category = caregory
-
-	switch caregory {
-	case CategoryPomodoro:
-		i.PlanDuration = config.PomodoroDuration
-	case CategoryShortBreak:
-		i.PlanDuration = config.ShortBreakDuration
-	case CategoryLongBreak:
-		i.PlanDuration = config.LongBreakDuration
-	}
-
-	if i.ID, err = config.repo.Create(i); err != nil {
-		return i, err
-	}
-
-	return i, nil
-}
-
-func GetInterval(config *IntervalConfig) (Interval, error) {
-	i := Interval{}
-	var err error
-
-	i, err = config.repo.Last()
-
-	if err != nil && err != ErrNoInterval {
-		return i, err
-	}
-
-	if err == nil && i.State != StateCancelled && i.State != StateDone {
-		return i, nil
-	}
-
-	return newInterval(config)
-}
-
-func (i Interval) Start(ctx context.Context, config *IntervalConfig, start, periodic, end Callback) error {
-	switch i.State {
-	case StateRunning:
-		return nil
-	case StateNotStarted:
-		i.StartTime = time.Now()
-		fallthrough
-	case StatePaused:
-		i.State = StateRunning
-		if err := config.repo.Update(i); err != nil {
-			return err
-		}
-		return tick(ctx, i.ID, config, start, periodic, end)
-	case StateCancelled, StateDone:
-		return fmt.Errorf("%w: Cannot Start", ErrIntervalCompleted)
-	default:
-		return fmt.Errorf("%w: %d", ErrInvalidState, i.State)
-	}
-}
-
-func (i Interval) Pause(config *IntervalConfig) error {
-	if i.State != StateRunning {
-		return ErrIntervalNotRunning
-	}
-
-	i.State = StatePaused
-
-	return config.repo.Update(i)
 }
