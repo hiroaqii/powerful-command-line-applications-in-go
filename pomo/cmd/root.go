@@ -1,6 +1,3 @@
-/*
-Copyright © 2023 NAME HERE <EMAIL ADDRESS>
-*/
 package cmd
 
 import (
@@ -61,6 +58,7 @@ func init() {
 	rootCmd.Flags().DurationP("short", "s", 5*time.Minute, "Short break duration")
 	rootCmd.Flags().DurationP("long", "l", 15*time.Minute, "Long break duration")
 
+	viper.BindPFlag("db", rootCmd.Flags().Lookup("db"))
 	viper.BindPFlag("pomo", rootCmd.Flags().Lookup("pomo"))
 	viper.BindPFlag("short", rootCmd.Flags().Lookup("short"))
 	viper.BindPFlag("long", rootCmd.Flags().Lookup("long"))
